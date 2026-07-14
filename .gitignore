@@ -1,0 +1,16 @@
+# macOS
+.DS_Store
+
+# Eclipse / STM32CubeIDE workspace metadata
+.metadata/
+
+# Build output
+Debug/
+Release/
+*.o
+*.d
+*.elf
+*.bin
+*.hex
+*.map
+*.list
