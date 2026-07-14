@@ -10,6 +10,7 @@
  *******************************************************************************/
 
 #include "app/do_operation.h"
+#include "app/adaptive_sf.h"
 #include "app/commctl.h"
 #include "app/params.h"
 #include "app/usr_main.h"
@@ -49,6 +50,12 @@ static void TimerWakeupProcess(void);
 static void SendTimerProcess(void);
 #if defined(BLD_ENABLE_RFMODE_RSSI_CHECK)
 static void RssiCheckProcess(void);
+#endif
+#if defined(BLD_ENABLE_ADAPTIVE_SF)
+static void AdaptiveSfStart(void);
+static void AdaptiveSfProcess(void);
+static void AdaptiveSfApply(uint8_t newSf);
+static bool_t AdaptiveSfProtocolIsLora(void);
 #endif
 
 static void StartCommInput(void);
@@ -112,6 +119,12 @@ static uint8_t gSendPayloadLen;
 static bool_t gWithParams = FALSE;
 static smacRouteParams_t gRouteParams;
 static SmacTransParams_t gTransParams;
+
+#if defined(BLD_ENABLE_ADAPTIVE_SF)
+// One-shot guard so the adaptive-SF loop is seeded and its sampling timer is
+// started only the first time the receiver is armed, not on every RX re-arm.
+static bool_t gAdaptiveSfStarted = FALSE;
+#endif
 
 /*******************************************************************************
 ********************************************************************************
@@ -467,6 +480,12 @@ static smacErrors_t SetRadioModeOnIdle(void) {
       }
 
       gIsReceiving = TRUE;
+
+#if defined(BLD_ENABLE_ADAPTIVE_SF)
+      // Seed the adaptive-SF loop and start its interference sampling on the
+      // first RX arm (no-op on later re-arms via its one-shot guard).
+      AdaptiveSfStart();
+#endif
     }
     break;
 
@@ -627,6 +646,15 @@ static void ProcessEvent(uint32_t ev) {
     ClearEvent(EVENT_RSSI_CHECK);
 
     RssiCheckProcess();
+  }
+#endif
+
+#if defined(BLD_ENABLE_ADAPTIVE_SF)
+  /* adaptive spreading-factor control step */
+  if (EVENT_ADAPTIVE_SF & ev) {
+    ClearEvent(EVENT_ADAPTIVE_SF);
+
+    AdaptiveSfProcess();
   }
 #endif
 
@@ -1602,6 +1630,136 @@ static void RssiCheckProcess(void) {
 }
 #endif
 
+#if defined(BLD_ENABLE_ADAPTIVE_SF)
+/*******************************************************************************
+ *
+ * AdaptiveSfProtocolIsLora
+ *
+ * Interface assumptions:
+ *     None
+ *
+ * Return value:
+ *     TRUE when the active protocol is a LoRa variant (SF is meaningful).
+ *
+ *******************************************************************************/
+static bool_t AdaptiveSfProtocolIsLora(void) {
+#if defined(BLD_USE_FSK_R)
+  if (mTermParam.Protocol == Protocol_FSK_R) {
+    return FALSE;
+  }
+#endif
+  return TRUE;
+}
+
+/*******************************************************************************
+ *
+ * AdaptiveSfStart
+ *
+ * Seed the adaptive-SF loop with the SF currently programmed into the radio
+ * and start the periodic interference-sampling timer. One-shot: further calls
+ * (e.g. RX re-arms) are ignored.
+ *
+ * Interface assumptions:
+ *     None
+ *
+ * Return value:
+ *     None
+ *
+ *******************************************************************************/
+static void AdaptiveSfStart(void) {
+  PhyRadioParams_t params;
+  uint8_t initialSf = ADAPTIVE_SF_FAST;
+
+  if (gAdaptiveSfStarted) {
+    return;
+  }
+
+  // The loop only makes sense for LoRa in the bidirectional RX/TX mode.
+  if (mTermParam.RfMode != RFMODE_TXRX || !AdaptiveSfProtocolIsLora()) {
+    return;
+  }
+
+  if (SMAC_GetRadioParams(&params) == gErrorNoError_c) {
+    initialSf = params.modulation.LORA.sf;
+  }
+  AdaptiveSf_Init(initialSf);
+
+  UsrTimer_start(UsrAdaptiveSfTimer, UsrTimerMode_Periodic,
+                 ADAPTIVE_SF_SAMPLE_MS, UsrTimerCallback);
+
+  gAdaptiveSfStarted = TRUE;
+}
+
+/*******************************************************************************
+ *
+ * AdaptiveSfApply
+ *
+ * Program a new spreading factor into the radio and re-arm the receiver so it
+ * takes effect immediately. Subsequent transmissions inherit the new SF via
+ * the shared radio params.
+ *
+ * Interface assumptions:
+ *     newSf        the spreading factor to switch to
+ *
+ * Return value:
+ *     None
+ *
+ *******************************************************************************/
+static void AdaptiveSfApply(uint8_t newSf) {
+  PhyRadioParams_t params;
+
+  if (SMAC_GetRadioParams(&params) != gErrorNoError_c) {
+    return;
+  }
+  params.modulation.LORA.sf = newSf;
+  if (SMAC_SetRadioParams(&params) != gErrorNoError_c) {
+    return;
+  }
+
+  // Re-arm RX: the stored params are only latched into the modem when the next
+  // receive starts, so drop out of the current RX and start it again.
+  if (gIsReceiving) {
+    gIsReceiving = FALSE;
+    SMAC_Standby();
+    SetRadioModeOnIdle();
+  }
+
+  Terminal_Print("adaptive sf -> SF%u\r\n", (unsigned)newSf);
+}
+
+/*******************************************************************************
+ *
+ * AdaptiveSfProcess
+ *
+ * One control step: sample the ambient interference and, if the policy decides
+ * to hop between SF7 and SF10, apply the new spreading factor.
+ *
+ * Interface assumptions:
+ *     None
+ *
+ * Return value:
+ *     None
+ *
+ *******************************************************************************/
+static void AdaptiveSfProcess(void) {
+  uint8_t rssiMag;
+  uint8_t newSf;
+
+  // Only sample when idle in RX. During a transmission or retry the RSSI is
+  // not the ambient floor, and re-arming to change SF would disrupt the
+  // exchange in flight.
+  if (!gIsReceiving || gIsSending || gIsRetrySending) {
+    return;
+  }
+
+  rssiMag = SMAC_GetRssi();
+
+  if (AdaptiveSf_Update(rssiMag, &newSf)) {
+    AdaptiveSfApply(newSf);
+  }
+}
+#endif
+
 /*******************************************************************************
  *
  * SetRadioSleep
@@ -1690,6 +1848,12 @@ static void UsrTimerCallback(UsrTimerId timerId) {
 #if defined(BLD_ENABLE_RFMODE_RSSI_CHECK)
   case UsrRssiCheckTimer:
     SetEvent(EVENT_RSSI_CHECK);
+    break;
+#endif
+
+#if defined(BLD_ENABLE_ADAPTIVE_SF)
+  case UsrAdaptiveSfTimer:
+    SetEvent(EVENT_ADAPTIVE_SF);
     break;
 #endif
 

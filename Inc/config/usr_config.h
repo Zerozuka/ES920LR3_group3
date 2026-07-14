@@ -26,6 +26,10 @@
 // Option
 //#define BLD_USE_SPCMD_RESET
 
+// Adaptive spreading-factor control loop (SF7 <-> SF10 by interference).
+// See app/adaptive_sf.h. Requires a LoRa protocol and RfMode == RFMODE_TXRX.
+#define BLD_ENABLE_ADAPTIVE_SF
+
 // for Debug
 //#define BLD_DEBUG_PRINT
 

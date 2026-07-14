@@ -48,6 +48,9 @@ typedef enum UserTimerId_tag
 #if defined(BLD_ENABLE_RFMODE_RSSI_CHECK)
     UsrRssiCheckTimer,
 #endif
+#if defined(BLD_ENABLE_ADAPTIVE_SF)
+    UsrAdaptiveSfTimer,
+#endif
     UsrTimer_MAX,
 } UsrTimerId;
 

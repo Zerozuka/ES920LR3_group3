@@ -37,6 +37,9 @@
 #define EVENT_SEND_TIME                 (1<<12)
 #define EVENT_RSSI_CHECK                (1<<13)
 #define EVENT_PHY_RX_TIMER              (1<<14)
+#if defined(BLD_ENABLE_ADAPTIVE_SF)
+#define EVENT_ADAPTIVE_SF               (1<<15)
+#endif
 
 // fiber id (bitmap)
 #define FIBER_PHY_CCA                   (1<<0)
