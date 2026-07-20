@@ -168,7 +168,9 @@ static uint32_t gCompStartTick = 0;
 static bool_t   gCompFinished = FALSE;
 
 // Counters
-static uint32_t gCompTxSeqNum = 0;       // TX sequence number
+static uint32_t gCompTxSeqNum = 0;       // TX sequence number (official payload only)
+static uint32_t gCompCtrlTxCount = 0;     // Control packets sent (not scored)
+static bool_t   gCompLastTxWasCtrl = FALSE; // What the in-flight TX carries
 static uint32_t gCompRxSuccessCount = 0;  // Total RX successes (+1 pt each)
 static uint32_t gCompRivalRxCount = 0;    // Total rival packets received
 static uint8_t  gLbtBlockCount = 0;       // Consecutive LBT blocks
@@ -1308,7 +1310,6 @@ static void SendDoneProcess( smacErrors_t result )
         if (result == gErrorNoError_c)
         {
             // === TX SUCCESS ===
-            gCompTxSeqNum++;
             gLbtBlockCount = 0;
             gChHopCount = 0;
             gCompTxState = COMP_STATE_AGGRESSIVE;
@@ -1318,13 +1319,29 @@ static void SendDoneProcess( smacErrors_t result )
             uint32_t toaMs = CompCalcToaMs(gSendPayloadLen, gCurrentSF);
             uint32_t restMs = (toaMs * 9) + 50;
 
-            Terminal_Print("[%08u] [TX_NODE] TX_OK SEQ=%u CH=%u SF=%u ToA=%u ms Rest=%u ms\r\n",
-                           (unsigned int)HAL_GetTick(),
-                           (unsigned int)gCompTxSeqNum,
-                           gCompChannels[gCurrentChIdx],
-                           gCurrentSF,
-                           (unsigned int)toaMs,
-                           (unsigned int)restMs);
+            // Control packets sync our own RX node; only official payload
+            // sends count toward the score log (score = successful receptions).
+            if (gCompLastTxWasCtrl)
+            {
+                gCompCtrlTxCount++;
+                Terminal_Print("[%08u] [TX_NODE] CTRL_OK total_ctrl=%u CH=%u ToA=%u ms Rest=%u ms\r\n",
+                               (unsigned int)HAL_GetTick(),
+                               (unsigned int)gCompCtrlTxCount,
+                               gCompChannels[gCurrentChIdx],
+                               (unsigned int)toaMs,
+                               (unsigned int)restMs);
+            }
+            else
+            {
+                gCompTxSeqNum++;
+                Terminal_Print("[%08u] [TX_NODE] TX_OK SEQ=%u CH=%u SF=%u ToA=%u ms Rest=%u ms\r\n",
+                               (unsigned int)HAL_GetTick(),
+                               (unsigned int)gCompTxSeqNum,
+                               gCompChannels[gCurrentChIdx],
+                               gCurrentSF,
+                               (unsigned int)toaMs,
+                               (unsigned int)restMs);
+            }
 
             // Schedule next TX after dynamic duty cycle rest (ToA × 9)
             // During this rest, the TX node is in RX mode scouting safely!
@@ -2143,6 +2160,7 @@ static void SendTimerProcess( void )
             {
                 // Send control packet to lead RX Node (0 penalty for others, Q3)
                 gPendingCtrlSend = FALSE;
+                gCompLastTxWasCtrl = TRUE;
                 strncpy(payloadStr, gPendingCtrlBuf, sizeof(payloadStr));
                 payloadLen = strlen(payloadStr);
 
@@ -2151,8 +2169,9 @@ static void SendTimerProcess( void )
             }
             else
             {
-                // Send official 50B payload (+1 point)
+                // Send official payload (scored on the RX side per reception)
                 // "GRP3:LORA_AD_HOC_SPECTRUM_SURVIVAL_PAYLOAD" (exact official string)
+                gCompLastTxWasCtrl = FALSE;
                 strncpy(payloadStr, COMP_OFFICIAL_PAYLOAD, sizeof(payloadStr));
                 payloadLen = strlen(payloadStr);
 
@@ -2513,7 +2532,11 @@ static void CompPrintFinalSummary( void )
         Terminal_Print("   Role: RECEIVER NODE\r\n");
     }
     Terminal_Print("   ----------------------------------------------\r\n");
-    Terminal_Print("   Total Received Packets : %u (+%d pts)\r\n", 
+    Terminal_Print("   Official TX Success    : %u packets (scored via RX side)\r\n",
+                   (unsigned int)gCompTxSeqNum);
+    Terminal_Print("   Control Packets Sent   : %u (not scored)\r\n",
+                   (unsigned int)gCompCtrlTxCount);
+    Terminal_Print("   Total Received Packets : %u (+%d pts)\r\n",
                    (unsigned int)gCompRxSuccessCount, (int)gCompRxSuccessCount);
     Terminal_Print("   Total Rival Packets    : %u (-%d pts)\r\n", 
                    (unsigned int)gCompRivalRxCount, (int)gCompRivalRxCount * 5);
