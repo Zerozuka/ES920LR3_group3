@@ -60,9 +60,14 @@
 
 // --- Thresholds ---
 #define LBT_BLOCK_THRESHOLD     3     // Consecutive CCA failures to trigger CH hop
-#define STEALTH_DURATION_MS     500   // How long RX stays in SF10 stealth
+// SF10 stealth is a SINGLE-SHOT dodge: hide just long enough to let the one
+// rival SF7 packet that just hit us pass, then return to SF7. A 62 B SF7 frame
+// tops out near 154 ms ToA (BW125), so ~230 ms covers one packet with margin.
+// Escaping sustained congestion is the CH hop's job, not stealth's.
+#define STEALTH_DURATION_MS     230   // How long RX stays in SF10 stealth
 #define LBT_RETRY_BACKOFF_MS    100   // Backoff on each CCA failure
 #define CTRL_SEND_MAX_RETRY     2     // Blocked ctrl-send retries before hopping anyway
+#define LOST_TX_TIMEOUT_MS      5000  // No own packet for this long -> RX hops to find TX
 
 // --- 10 Minutes Duration ---
 #define COMP_DURATION_MS        600000 // 10 minutes (600,000 ms)
@@ -182,6 +187,7 @@ static char     gPendingCtrlBuf[32];
 static bool_t   gCompHopPending = FALSE;    // CH hop armed, awaiting ctrl delivery
 static uint8_t  gCompPendingHopChIdx = 0;   // Destination channel index of the pending hop
 static uint8_t  gCompCtrlRetryCount = 0;    // Blocked ctrl-send attempts for this hop
+static uint32_t gCompLastOwnRxTick = 0;     // HAL_GetTick() when RX last heard our TX node
 #endif
 
 /*******************************************************************************
@@ -437,6 +443,7 @@ static void InitProcess( void )
     
     // Initialize 10-Minute Timer
     gCompStartTick = HAL_GetTick();
+    gCompLastOwnRxTick = HAL_GetTick();
     gCompFinished = FALSE;
 
     // Apply initial channel and SF to stack
@@ -473,7 +480,7 @@ static void InitProcess( void )
     {
         // RX Node stays in RX mode listening and starts lost-TX timeout timer
         SetRadioModeOnIdle();
-        CompScheduleNextTx(5000);
+        CompScheduleNextTx(LOST_TX_TIMEOUT_MS);
     }
 #else
     if( !gEnterSleep )
@@ -1685,10 +1692,10 @@ static void SmacCallback_onNotifyRxData( smacErrors_t result, const SmacUser_RxR
                     Terminal_Print("[%08u] [RX_NODE] Following TX Node to CH7\r\n", (unsigned int)HAL_GetTick());
                 }
 
-                // Following a command counts as hearing our TX node; restart
-                // the lost-TX timeout so a stale timer does not hop us away
+                // Following a command counts as hearing our TX node; refresh
+                // the last-heard time so the lost-TX check does not hop us away
                 // right after arriving on the commanded channel.
-                CompScheduleNextTx(5000);
+                gCompLastOwnRxTick = HAL_GetTick();
             }
             return;
         }
@@ -1699,10 +1706,11 @@ static void SmacCallback_onNotifyRxData( smacErrors_t result, const SmacUser_RxR
 
         if (IS_RX_NODE())
         {
-            // Reset the lost-TX timeout timer back to 5 seconds upon receiving our group's packets
+            // Heard our group: refresh the last-heard time so the lost-TX
+            // check (in SendTimerProcess) does not fire while TX is reaching us.
             if (isOwnPacket || memcmp(tempMsg, COMP_CTRL_PREFIX, strlen(COMP_CTRL_PREFIX)) == 0)
             {
-                CompScheduleNextTx(5000);
+                gCompLastOwnRxTick = HAL_GetTick();
             }
 
             // Count +1 point only when RX Node successfully receives our official data packet
@@ -1754,7 +1762,7 @@ static void SmacCallback_onNotifyRxData( smacErrors_t result, const SmacUser_RxR
                     Terminal_Print("[%08u] [RX_NODE] Entering SF10 Stealth for %d ms\r\n",
                                    (unsigned int)HAL_GetTick(), STEALTH_DURATION_MS);
 
-                    // Auto-exit stealth after 500ms
+                    // Auto-exit stealth after STEALTH_DURATION_MS (single-shot dodge)
                     CompScheduleNextTx(STEALTH_DURATION_MS);
                 }
             }
@@ -2263,22 +2271,27 @@ static void SendTimerProcess( void )
         else // IS_RX_NODE()
         {
             // ================= RX NODE TIMER HANDLING =================
+            // This timer serves two jobs on the SAME UsrTxIntervalTimer:
+            // exiting a stealth window (short) and the lost-TX watchdog (long).
+            // The hop decision is made on ELAPSED TIME since we last heard our
+            // TX node -- not on which schedule fired -- so repeated stealth
+            // cycles re-arming the timer at STEALTH_DURATION_MS can no longer
+            // starve the lost-TX hop.
+
+            // Leave stealth if we were hiding (SF10 -> SF7).
             if (gCompRxState == COMP_RX_STATE_STEALTH)
             {
-                // 1. Timer expired while in stealth → exit stealth and return to SF7
                 gCompRxState = COMP_RX_STATE_NORMAL;
                 gCurrentSF = 7;
                 ApplyChannelAndSf(gCompChannels[gCurrentChIdx], 7);
                 Terminal_Print("[%08u] [RX_NODE] Stealth finished -> Returning to SF7 Normal\r\n",
                                (unsigned int)HAL_GetTick());
-
-                // Restart lost-TX timeout timer (5 seconds)
-                CompScheduleNextTx(5000);
             }
-            else
+
+            // Lost-TX watchdog: hop only if we truly have not heard our TX node
+            // for LOST_TX_TIMEOUT_MS.
+            if ((HAL_GetTick() - gCompLastOwnRxTick) >= LOST_TX_TIMEOUT_MS)
             {
-                // 2. 5 seconds elapsed without receiving any self group (GRP3) packets!
-                // Autonomously hop channel to find the TX node.
                 uint16_t fromCh = gCompChannels[gCurrentChIdx];
                 gCurrentChIdx = 1 - gCurrentChIdx;
                 uint16_t toCh = gCompChannels[gCurrentChIdx];
@@ -2288,9 +2301,12 @@ static void SendTimerProcess( void )
 
                 ApplyChannelAndSf(toCh, 7);
 
-                // Restart timeout timer
-                CompScheduleNextTx(5000);
+                // Give the new channel a full window before reconsidering.
+                gCompLastOwnRxTick = HAL_GetTick();
             }
+
+            // Keep the RX housekeeping timer ticking.
+            CompScheduleNextTx(LOST_TX_TIMEOUT_MS);
         }
 #else
         const uint8_t payloadLen = (uint8_t) strlen((char*)mTermParam.SendData);
