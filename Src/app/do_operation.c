@@ -62,6 +62,7 @@
 #define LBT_BLOCK_THRESHOLD     3     // Consecutive CCA failures to trigger CH hop
 #define STEALTH_DURATION_MS     500   // How long RX stays in SF10 stealth
 #define LBT_RETRY_BACKOFF_MS    100   // Backoff on each CCA failure
+#define CTRL_SEND_MAX_RETRY     2     // Blocked ctrl-send retries before hopping anyway
 
 // --- 10 Minutes Duration ---
 #define COMP_DURATION_MS        600000 // 10 minutes (600,000 ms)
@@ -81,6 +82,7 @@ typedef enum {
 static void ApplyChannelAndSf( uint16_t ch, uint16_t sf );
 static void CompScheduleNextTx( uint32_t delayMs );
 static void CompTxDoChHop( const char* trigger );
+static void CompCompleteHop( const char* how );
 static void CompSendCtrlPacket( const char* ctrlMsg );
 static void CompPrintFinalSummary( void );
 static void CompCheckDuration( void );
@@ -177,6 +179,9 @@ static uint8_t  gLbtBlockCount = 0;       // Consecutive LBT blocks
 static uint8_t  gChHopCount = 0;          // CH hops
 static bool_t   gPendingCtrlSend = FALSE;
 static char     gPendingCtrlBuf[32];
+static bool_t   gCompHopPending = FALSE;    // CH hop armed, awaiting ctrl delivery
+static uint8_t  gCompPendingHopChIdx = 0;   // Destination channel index of the pending hop
+static uint8_t  gCompCtrlRetryCount = 0;    // Blocked ctrl-send attempts for this hop
 #endif
 
 /*******************************************************************************
@@ -1343,36 +1348,72 @@ static void SendDoneProcess( smacErrors_t result )
                                (unsigned int)restMs);
             }
 
+            // A transmitted hop command means the RX node is moving; follow
+            // it now, before the next official send goes out.
+            if (gCompLastTxWasCtrl && gCompHopPending)
+            {
+                CompCompleteHop("CTRL_DELIVERED");
+            }
+
             // Schedule next TX after dynamic duty cycle rest (ToA × 9)
             // During this rest, the TX node is in RX mode scouting safely!
             CompScheduleNextTx(restMs);
         }
         else if (result == gErrorChannelBusy_c)
         {
-            // === LBT BLOCKED (CCA failed) ===
-            gLbtBlockCount++;
-
-            Terminal_Print("[%08u] [TX_NODE] LBT_BLOCK CH=%u SF=%u (count=%u)\r\n",
-                           (unsigned int)HAL_GetTick(),
-                           gCompChannels[gCurrentChIdx],
-                           gCurrentSF,
-                           (unsigned int)gLbtBlockCount);
-
-            if (gLbtBlockCount >= LBT_BLOCK_THRESHOLD)
+            if (gCompLastTxWasCtrl && gCompHopPending)
             {
-                // Threshold reached → Hop channel + Send Control Packet to lead RX node!
-                gLbtBlockCount = 0;
-                gChHopCount++;
+                // === HOP COMMAND BLOCKED on the (congested) old channel ===
+                gCompCtrlRetryCount++;
 
-                CompTxDoChHop("LBT_THRESHOLD");
-                gCompTxState = COMP_STATE_DEFENSIVE;
-                CompScheduleNextTx(10);  // Send control packet / retry
+                Terminal_Print("[%08u] [TX_NODE] CTRL_BLOCK CH=%u (retry %u/%u)\r\n",
+                               (unsigned int)HAL_GetTick(),
+                               gCompChannels[gCurrentChIdx],
+                               (unsigned int)gCompCtrlRetryCount,
+                               (unsigned int)CTRL_SEND_MAX_RETRY);
+
+                if (gCompCtrlRetryCount > CTRL_SEND_MAX_RETRY)
+                {
+                    // Too busy to even deliver the hop command. Hop anyway;
+                    // the RX node re-syncs via its lost-TX timeout hop.
+                    CompCompleteHop("CTRL_GIVEUP");
+                    CompScheduleNextTx(10);
+                }
+                else
+                {
+                    // Re-queue the same command and retry shortly on this CH.
+                    gPendingCtrlSend = TRUE;
+                    CompScheduleNextTx(20 + SMAC_GetRandom(0, 50));
+                }
             }
             else
             {
-                // Below threshold → short backoff and retry same CH
-                uint32_t backoff = 50 + SMAC_GetRandom(0, LBT_RETRY_BACKOFF_MS);
-                CompScheduleNextTx(backoff);
+                // === LBT BLOCKED (CCA failed) ===
+                gLbtBlockCount++;
+
+                Terminal_Print("[%08u] [TX_NODE] LBT_BLOCK CH=%u SF=%u (count=%u)\r\n",
+                               (unsigned int)HAL_GetTick(),
+                               gCompChannels[gCurrentChIdx],
+                               gCurrentSF,
+                               (unsigned int)gLbtBlockCount);
+
+                if (gLbtBlockCount >= LBT_BLOCK_THRESHOLD)
+                {
+                    // Threshold reached → arm the hop; the control packet goes
+                    // out first on THIS channel to lead the RX node over.
+                    gLbtBlockCount = 0;
+                    gChHopCount++;
+
+                    CompTxDoChHop("LBT_THRESHOLD");
+                    gCompTxState = COMP_STATE_DEFENSIVE;
+                    CompScheduleNextTx(10);  // Send the hop command
+                }
+                else
+                {
+                    // Below threshold → short backoff and retry same CH
+                    uint32_t backoff = 50 + SMAC_GetRandom(0, LBT_RETRY_BACKOFF_MS);
+                    CompScheduleNextTx(backoff);
+                }
             }
         }
         else
@@ -1383,6 +1424,20 @@ static void SendDoneProcess( smacErrors_t result )
                            (int)result,
                            gCompChannels[gCurrentChIdx],
                            gCurrentSF);
+
+            if (gCompLastTxWasCtrl && gCompHopPending)
+            {
+                // Keep the hop command (not the payload) in flight, bounded.
+                gCompCtrlRetryCount++;
+                if (gCompCtrlRetryCount > CTRL_SEND_MAX_RETRY)
+                {
+                    CompCompleteHop("CTRL_GIVEUP");
+                }
+                else
+                {
+                    gPendingCtrlSend = TRUE;
+                }
+            }
             CompScheduleNextTx(500);
         }
     }
@@ -1629,6 +1684,11 @@ static void SmacCallback_onNotifyRxData( smacErrors_t result, const SmacUser_RxR
                     ApplyChannelAndSf(COMP_CHANNEL_2, 7);
                     Terminal_Print("[%08u] [RX_NODE] Following TX Node to CH7\r\n", (unsigned int)HAL_GetTick());
                 }
+
+                // Following a command counts as hearing our TX node; restart
+                // the lost-TX timeout so a stale timer does not hop us away
+                // right after arriving on the commanded channel.
+                CompScheduleNextTx(5000);
             }
             return;
         }
@@ -1660,11 +1720,13 @@ static void SmacCallback_onNotifyRxData( smacErrors_t result, const SmacUser_RxR
             // TX node receives packets safely without penalty! Use for scouting.
             if (!isOwnPacket)
             {
+                // Scout log only -- no hop. The rival that just finished
+                // transmitting now owes a ToA*9 duty rest, so right after a
+                // scouted packet this channel tends to be at its SAFEST.
+                // CH hops are driven solely by the LBT 3-consecutive-block
+                // trigger in SendDoneProcess.
                 Terminal_Print("[%08u] [TX_SCOUT] Rival detected on CH=%u RSSI=%d msg=%s (0 penalty!)\r\n",
                                (unsigned int)HAL_GetTick(), gCompChannels[gCurrentChIdx], (int)rssiVal, tempMsg);
-
-                // Option: Trigger CH hop if rival activity is detected on current CH
-                CompTxDoChHop("RIVAL_SCOUTED");
             }
         }
         else // IS_RX_NODE()
@@ -2483,20 +2545,35 @@ static void CompSendCtrlPacket( const char* ctrlMsg )
 static void CompTxDoChHop( const char* trigger )
 {
     uint16_t fromCh = gCompChannels[gCurrentChIdx];
-
-    // Toggle channel
-    gCurrentChIdx = 1 - gCurrentChIdx;
-    uint16_t toCh = gCompChannels[gCurrentChIdx];
+    uint8_t toIdx = (uint8_t)(1 - gCurrentChIdx);
+    uint16_t toCh = gCompChannels[toIdx];
 
     Terminal_Print("[%08u] [TX_NODE] CH_HOP trigger=%s from=CH%u to=CH%u\r\n",
                    (unsigned int)HAL_GetTick(), trigger, fromCh, toCh);
 
-    // 1. Prepare control packet to instruct RX Node to hop
+    // Queue the hop command. It must be broadcast on the CURRENT channel,
+    // where the RX node is still listening -- hopping first would announce
+    // the move on the new channel that nobody hears. The actual switch
+    // happens in SendDoneProcess once the command has been transmitted, or
+    // after CTRL_SEND_MAX_RETRY blocked attempts (the RX node then re-syncs
+    // via its lost-TX timeout hop).
     const char* cmdMsg = (toCh == COMP_CHANNEL_1) ? COMP_CTRL_CH1 : COMP_CTRL_CH7;
     CompSendCtrlPacket(cmdMsg);
 
-    // 2. Apply new channel to TX node
-    ApplyChannelAndSf(toCh, 7);
+    gCompHopPending = TRUE;
+    gCompPendingHopChIdx = toIdx;
+    gCompCtrlRetryCount = 0;
+}
+
+static void CompCompleteHop( const char* how )
+{
+    gCompHopPending = FALSE;
+    gCompCtrlRetryCount = 0;
+    gCurrentChIdx = gCompPendingHopChIdx;
+    ApplyChannelAndSf(gCompChannels[gCurrentChIdx], 7);
+
+    Terminal_Print("[%08u] [TX_NODE] CH_HOP done (%s) now=CH%u\r\n",
+                   (unsigned int)HAL_GetTick(), how, gCompChannels[gCurrentChIdx]);
 }
 
 static void CompPrintFinalSummary( void )
