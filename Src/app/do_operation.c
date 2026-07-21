@@ -76,9 +76,12 @@
 // demodulating (an aborted reception is not a reception, hence no penalty).
 // Latching: there is no way back, by design.
 #define PANIC_SCORE_THRESHOLD   (-50)
-// Must stay BELOW the shortest realistic SF7 ToA (a 12 B SF7/BW125 frame is
-// about 52 ms; even a minimal frame is over 20 ms) so every reception is cut off.
-#define PANIC_CHURN_MS          20
+// Dwell time per cell. Any frame whose ToA exceeds this cannot finish
+// demodulating before we move: at SF7/BW125 the 42 B official payload is 113 ms
+// and even a 12 B frame is about 52 ms, so 50 ms cuts off all realistic
+// competition traffic. The node stays in RX the whole time -- it keeps
+// listening, it just never sits still long enough to complete a frame.
+#define PANIC_CHURN_MS          50
 #define PANIC_LOG_EVERY         50    // Log 1 in N churn steps (UART flood guard)
 
 // --- 10 Minutes Duration ---
