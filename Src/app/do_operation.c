@@ -69,6 +69,18 @@
 #define CTRL_SEND_MAX_RETRY     2     // Blocked ctrl-send retries before hopping anyway
 #define LOST_TX_TIMEOUT_MS      5000  // No own packet for this long -> RX hops to find TX
 
+// --- Panic mode (last resort) ---
+// Once the estimated score sinks this low, one more -5 costs more than five
+// more +1 could recover, so the RX node stops trying to score at all: it churns
+// CH/SF faster than any frame's Time-on-Air, so no rival packet can ever finish
+// demodulating (an aborted reception is not a reception, hence no penalty).
+// Latching: there is no way back, by design.
+#define PANIC_SCORE_THRESHOLD   (-50)
+// Must stay BELOW the shortest realistic SF7 ToA (a 12 B SF7/BW125 frame is
+// about 52 ms; even a minimal frame is over 20 ms) so every reception is cut off.
+#define PANIC_CHURN_MS          20
+#define PANIC_LOG_EVERY         50    // Log 1 in N churn steps (UART flood guard)
+
 // --- 10 Minutes Duration ---
 #define COMP_DURATION_MS        600000 // 10 minutes (600,000 ms)
 
@@ -91,6 +103,9 @@ static void CompCompleteHop( const char* how );
 static void CompSendCtrlPacket( const char* ctrlMsg );
 static void CompPrintFinalSummary( void );
 static void CompCheckDuration( void );
+static int32_t CompEstimatedScore( void );
+static void CompEnterPanic( void );
+static void CompPanicChurn( void );
 static uint32_t CompCalcToaMs( uint8_t payloadLen, uint16_t sf );
 #endif
 
@@ -188,6 +203,9 @@ static bool_t   gCompHopPending = FALSE;    // CH hop armed, awaiting ctrl deliv
 static uint8_t  gCompPendingHopChIdx = 0;   // Destination channel index of the pending hop
 static uint8_t  gCompCtrlRetryCount = 0;    // Blocked ctrl-send attempts for this hop
 static uint32_t gCompLastOwnRxTick = 0;     // HAL_GetTick() when RX last heard our TX node
+static bool_t   gCompPanicMode = FALSE;     // Latched: scoring abandoned, evade only
+static uint8_t  gCompPanicIdx = 0;          // Cursor over the 4 (ch, sf) churn cells
+static uint32_t gCompPanicSteps = 0;        // Churn steps taken (telemetry)
 #endif
 
 /*******************************************************************************
@@ -1753,6 +1771,14 @@ static void SmacCallback_onNotifyRxData( smacErrors_t result, const SmacUser_RxR
                                (unsigned int)gCompRivalRxCount,
                                tempMsg);
 
+                // 0. Last resort: once the score is deep enough underwater,
+                //    stop playing for points and just become unreceivable.
+                if (!gCompPanicMode && CompEstimatedScore() <= PANIC_SCORE_THRESHOLD)
+                {
+                    CompEnterPanic();
+                    return;
+                }
+
                 // 1. SF Stealth (Bonus 2): Switch to SF10 temporarily to hide
                 if (gCompRxState == COMP_RX_STATE_NORMAL)
                 {
@@ -2271,6 +2297,14 @@ static void SendTimerProcess( void )
         else // IS_RX_NODE()
         {
             // ================= RX NODE TIMER HANDLING =================
+            // Panic overrides everything: no stealth, no lost-TX hop, no
+            // scoring -- just keep moving so nothing can be received.
+            if (gCompPanicMode)
+            {
+                CompPanicChurn();
+                return;
+            }
+
             // This timer serves two jobs on the SAME UsrTxIntervalTimer:
             // exiting a stealth window (short) and the lost-TX watchdog (long).
             // The hop decision is made on ELAPSED TIME since we last heard our
@@ -2609,7 +2643,7 @@ static void CompPrintFinalSummary( void )
     // Reception: +1 pt per successfully received own data packet
     // Rival RX: -5 pt per hit
     // Bonuses: CH Hopping (+50) + SF Stealth (+50) = +100
-    int32_t finalScore = (int32_t)gCompRxSuccessCount - ((int32_t)gCompRivalRxCount * 5) + 100;
+    int32_t finalScore = CompEstimatedScore() + 100;
 
     Terminal_Print("\r\n\r\n");
     Terminal_Print("==================================================\r\n");
@@ -2634,9 +2668,71 @@ static void CompPrintFinalSummary( void )
     Terminal_Print("   Total Rival Packets    : %u (-%d pts)\r\n", 
                    (unsigned int)gCompRivalRxCount, (int)gCompRivalRxCount * 5);
     Terminal_Print("   Technical Bonuses      : +100 pts (Autonomous Hop + SF Stealth)\r\n");
+    if (gCompPanicMode)
+    {
+        Terminal_Print("   PANIC MODE             : engaged (%u churn steps, scoring abandoned)\r\n",
+                       (unsigned int)gCompPanicSteps);
+    }
     Terminal_Print("   ----------------------------------------------\r\n");
     Terminal_Print("   ESTIMATED GROUP SCORE  : %d pts\r\n", (int)finalScore);
     Terminal_Print("==================================================\r\n\r\n");
+}
+
+static int32_t CompEstimatedScore( void )
+{
+    // Scoring is reception-based: +1 per own official packet received,
+    // -5 per rival packet received. Bonuses are excluded on purpose -- this is
+    // the number the panic trigger reasons about.
+    return (int32_t)gCompRxSuccessCount - ((int32_t)gCompRivalRxCount * 5);
+}
+
+static void CompEnterPanic( void )
+{
+    gCompPanicMode = TRUE;
+    gCompPanicIdx = 0;
+
+    // Stealth is pointless from here on: churning covers it and then some.
+    gCompRxState = COMP_RX_STATE_NORMAL;
+
+    Terminal_Print("[%08u] [PANIC] score=%d <= %d : abandoning scoring, "
+                   "high-speed CH/SF churn every %u ms (evasion only)\r\n",
+                   (unsigned int)HAL_GetTick(),
+                   (int)CompEstimatedScore(),
+                   (int)PANIC_SCORE_THRESHOLD,
+                   (unsigned int)PANIC_CHURN_MS);
+
+    CompScheduleNextTx(PANIC_CHURN_MS);
+}
+
+static void CompPanicChurn( void )
+{
+    uint16_t ch;
+    uint16_t sf;
+
+    // Walk the 4 cells {CH1,CH7} x {SF7,SF10}. Every step changes the channel,
+    // the spreading factor, or both, so the receiver never sits still long
+    // enough to finish demodulating a frame.
+    gCurrentChIdx = (uint8_t)((gCompPanicIdx >> 1) & 1u);
+    ch = gCompChannels[gCurrentChIdx];
+    sf = (gCompPanicIdx & 1u) ? 10 : 7;
+
+    gCompPanicIdx = (uint8_t)((gCompPanicIdx + 1u) & 3u);
+    gCompPanicSteps++;
+
+    gCurrentSF = sf;
+    ApplyChannelAndSf(ch, sf);
+
+    // Log sparsely: printing every step would throttle the event loop on UART.
+    if ((gCompPanicSteps % PANIC_LOG_EVERY) == 0)
+    {
+        Terminal_Print("[%08u] [PANIC] churn step=%u now CH=%u SF=%u (rival_rx=%u)\r\n",
+                       (unsigned int)HAL_GetTick(),
+                       (unsigned int)gCompPanicSteps,
+                       ch, sf,
+                       (unsigned int)gCompRivalRxCount);
+    }
+
+    CompScheduleNextTx(PANIC_CHURN_MS);
 }
 
 static void CompCheckDuration( void )
