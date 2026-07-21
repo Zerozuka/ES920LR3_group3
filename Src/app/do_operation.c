@@ -75,7 +75,12 @@
 // CH/SF faster than any frame's Time-on-Air, so no rival packet can ever finish
 // demodulating (an aborted reception is not a reception, hence no penalty).
 // Latching: there is no way back, by design.
-#define PANIC_SCORE_THRESHOLD   (-50)
+// Technical bonus we claim (autonomous CH hop + SF stealth). Added to the
+// reception-based score to form the total the final report states.
+#define COMP_BONUS_POINTS       100
+// Panic trips once the TOTAL score (receptions + bonus) sinks to this. At this
+// point one more -5 costs more than the +1s still within reach.
+#define PANIC_TOTAL_SCORE       50
 // Churn stays on SF10 and only moves between channels. SF10 is orthogonal to
 // the SF7 rivals use for the official payload, so those frames cannot be
 // demodulated at all -- protection that does not depend on timing. Should a
@@ -110,6 +115,7 @@ static void CompSendCtrlPacket( const char* ctrlMsg );
 static void CompPrintFinalSummary( void );
 static void CompCheckDuration( void );
 static int32_t CompEstimatedScore( void );
+static int32_t CompTotalScore( void );
 static void CompEnterPanic( void );
 static void CompPanicChurn( void );
 static uint32_t CompCalcToaMs( uint8_t payloadLen, uint16_t sf );
@@ -1779,7 +1785,7 @@ static void SmacCallback_onNotifyRxData( smacErrors_t result, const SmacUser_RxR
 
                 // 0. Last resort: once the score is deep enough underwater,
                 //    stop playing for points and just become unreceivable.
-                if (!gCompPanicMode && CompEstimatedScore() <= PANIC_SCORE_THRESHOLD)
+                if (!gCompPanicMode && CompTotalScore() <= PANIC_TOTAL_SCORE)
                 {
                     CompEnterPanic();
                     return;
@@ -2649,7 +2655,7 @@ static void CompPrintFinalSummary( void )
     // Reception: +1 pt per successfully received own data packet
     // Rival RX: -5 pt per hit
     // Bonuses: CH Hopping (+50) + SF Stealth (+50) = +100
-    int32_t finalScore = CompEstimatedScore() + 100;
+    int32_t finalScore = CompTotalScore();
 
     Terminal_Print("\r\n\r\n");
     Terminal_Print("==================================================\r\n");
@@ -2673,7 +2679,8 @@ static void CompPrintFinalSummary( void )
                    (unsigned int)gCompRxSuccessCount, (int)gCompRxSuccessCount);
     Terminal_Print("   Total Rival Packets    : %u (-%d pts)\r\n", 
                    (unsigned int)gCompRivalRxCount, (int)gCompRivalRxCount * 5);
-    Terminal_Print("   Technical Bonuses      : +100 pts (Autonomous Hop + SF Stealth)\r\n");
+    Terminal_Print("   Technical Bonuses      : +%d pts (Autonomous Hop + SF Stealth)\r\n",
+                   (int)COMP_BONUS_POINTS);
     if (gCompPanicMode)
     {
         Terminal_Print("   PANIC MODE             : engaged (%u churn steps, scoring abandoned)\r\n",
@@ -2692,6 +2699,12 @@ static int32_t CompEstimatedScore( void )
     return (int32_t)gCompRxSuccessCount - ((int32_t)gCompRivalRxCount * 5);
 }
 
+static int32_t CompTotalScore( void )
+{
+    // What the final report claims: reception score plus the technical bonus.
+    return CompEstimatedScore() + COMP_BONUS_POINTS;
+}
+
 static void CompEnterPanic( void )
 {
     gCompPanicMode = TRUE;
@@ -2700,11 +2713,13 @@ static void CompEnterPanic( void )
     // Stealth is pointless from here on: churning covers it and then some.
     gCompRxState = COMP_RX_STATE_NORMAL;
 
-    Terminal_Print("[%08u] [PANIC] score=%d <= %d : abandoning scoring, "
-                   "SF%u channel churn every %u ms (evasion only)\r\n",
+    Terminal_Print("[%08u] [PANIC] total=%d (rx_score=%d + bonus=%d) <= %d : "
+                   "abandoning scoring, SF%u channel churn every %u ms\r\n",
                    (unsigned int)HAL_GetTick(),
+                   (int)CompTotalScore(),
                    (int)CompEstimatedScore(),
-                   (int)PANIC_SCORE_THRESHOLD,
+                   (int)COMP_BONUS_POINTS,
+                   (int)PANIC_TOTAL_SCORE,
                    (unsigned)PANIC_SF,
                    (unsigned int)PANIC_CHURN_MS);
 
