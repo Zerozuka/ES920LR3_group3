@@ -224,6 +224,7 @@ static uint8_t  gCompPanicIdx = 0;          // Cursor over the 4 (ch, sf) churn 
 static uint32_t gCompPanicSteps = 0;        // Churn steps taken (telemetry)
 static uint32_t gCompLastStatusTick = 0;    // HAL_GetTick() of the last status line
 static uint16_t gCompRxHopCount = 0;        // Channel changes made by the RX node
+static uint32_t gCompEmptyRxCount = 0;      // Zero-payload frames seen (never penalised)
 #endif
 
 /*******************************************************************************
@@ -1691,8 +1692,26 @@ static void SmacCallback_onNotifyRxData( smacErrors_t result, const SmacUser_RxR
         LED_Toggle( LED1 );
 
 #if COMPETITION_MODE
+        // A zero-length frame carries no competition payload at all. Every group
+        // shares PanId 0x0001 and broadcasts to 0xFFFF, so these well-formed but
+        // empty frames from other modules do reach us -- but they are neither our
+        // packet nor a scoring rival packet, so they must not cost -5 (nor waste a
+        // stealth window). Count them separately for the record and stop here.
+        if (params->payloadSize == 0)
+        {
+            gCompEmptyRxCount++;
+            Terminal_Print("[%08u] [RX_EMPTY] zero-length frame srcid=%04X (ignored, no penalty, total=%u)\r\n",
+                           (unsigned int)HAL_GetTick(),
+                           (unsigned)params->trans.addr.srcNode.nodeAddr,
+                           (unsigned int)gCompEmptyRxCount);
+            return;
+        }
+
         uint8_t* payload = getPacketPayload( &gAppRxPacket, (protocolType_t)mTermParam.Protocol );
-        char tempMsg[64];
+        // Zero the whole buffer: the classifying memcmp calls below read a fixed
+        // number of bytes, which would otherwise reach past a short payload into
+        // uninitialised stack.
+        char tempMsg[64] = {0};
         uint8_t copyLen = (params->payloadSize < 63) ? params->payloadSize : 63;
         if (payload != NULL && copyLen > 0)
         {
@@ -1703,10 +1722,6 @@ static void SmacCallback_onNotifyRxData( smacErrors_t result, const SmacUser_RxR
                 tempMsg[i] = (c >= 32 && c <= 126) ? (char)c : '.';
             }
             tempMsg[copyLen] = '\0';
-        }
-        else
-        {
-            tempMsg[0] = '\0';
         }
 
         // Extract RSSI
@@ -2721,6 +2736,8 @@ static void CompPrintFinalSummary( void )
                        (unsigned int)gCompRxSuccessCount, (int)gCompRxSuccessCount);
         Terminal_Print("   Rival Packets Received : %u (-%d pts)\r\n",
                        (unsigned int)gCompRivalRxCount, (int)gCompRivalRxCount * 5);
+        Terminal_Print("   Empty Frames Ignored   : %u (no payload, 0 pts)\r\n",
+                       (unsigned int)gCompEmptyRxCount);
         Terminal_Print("   Channel Hops           : %u\r\n",
                        (unsigned int)gCompRxHopCount);
         Terminal_Print("   Final Cell             : CH%u SF%u\r\n",
@@ -2832,11 +2849,12 @@ static void CompPeriodicStatus( void )
     }
     else
     {
-        Terminal_Print("[%08u] [STATUS] t=%us RX ok=%u rival=%u score=%d CH=%u SF=%u hops=%u%s\r\n",
+        Terminal_Print("[%08u] [STATUS] t=%us RX ok=%u rival=%u empty=%u score=%d CH=%u SF=%u hops=%u%s\r\n",
                        (unsigned int)HAL_GetTick(),
                        (unsigned int)elapsedS,
                        (unsigned int)gCompRxSuccessCount,
                        (unsigned int)gCompRivalRxCount,
+                       (unsigned int)gCompEmptyRxCount,
                        (int)CompTotalScore(),
                        gCompChannels[gCurrentChIdx],
                        gCurrentSF,
