@@ -94,6 +94,9 @@
 
 // --- 10 Minutes Duration ---
 #define COMP_DURATION_MS        600000 // 10 minutes (600,000 ms)
+// Periodic status line, so both roles leave a continuous trail in the log even
+// when nothing else happens (the RX node can otherwise be silent for minutes).
+#define COMP_STATUS_LOG_MS      30000  // 30 s
 
 // --- State Machine for TX ---
 typedef enum {
@@ -114,6 +117,7 @@ static void CompCompleteHop( const char* how );
 static void CompSendCtrlPacket( const char* ctrlMsg );
 static void CompPrintFinalSummary( void );
 static void CompCheckDuration( void );
+static void CompPeriodicStatus( void );
 static int32_t CompEstimatedScore( void );
 static int32_t CompTotalScore( void );
 static void CompEnterPanic( void );
@@ -218,6 +222,8 @@ static uint32_t gCompLastOwnRxTick = 0;     // HAL_GetTick() when RX last heard 
 static bool_t   gCompPanicMode = FALSE;     // Latched: scoring abandoned, evade only
 static uint8_t  gCompPanicIdx = 0;          // Cursor over the 4 (ch, sf) churn cells
 static uint32_t gCompPanicSteps = 0;        // Churn steps taken (telemetry)
+static uint32_t gCompLastStatusTick = 0;    // HAL_GetTick() of the last status line
+static uint16_t gCompRxHopCount = 0;        // Channel changes made by the RX node
 #endif
 
 /*******************************************************************************
@@ -474,6 +480,7 @@ static void InitProcess( void )
     // Initialize 10-Minute Timer
     gCompStartTick = HAL_GetTick();
     gCompLastOwnRxTick = HAL_GetTick();
+    gCompLastStatusTick = HAL_GetTick();
     gCompFinished = FALSE;
 
     // Apply initial channel and SF to stack
@@ -880,6 +887,16 @@ static void ProcessEvent( uint32_t ev )
 
         /* process reset WDT */
         WDG_Refresh();
+
+#if COMPETITION_MODE
+        // The heartbeat is the only timer guaranteed to run for the whole
+        // match, so drive the match clock and the status log from here. The RX
+        // node in particular has no send loop to piggyback on, and previously
+        // reached the 10-minute summary only if its own housekeeping timer
+        // happened to still be alive.
+        CompCheckDuration();
+        CompPeriodicStatus();
+#endif
     }
 }
 
@@ -1722,6 +1739,8 @@ static void SmacCallback_onNotifyRxData( smacErrors_t result, const SmacUser_RxR
                     Terminal_Print("[%08u] [RX_NODE] Following TX Node to CH7\r\n", (unsigned int)HAL_GetTick());
                 }
 
+                gCompRxHopCount++;
+
                 // Following a command counts as hearing our TX node; refresh
                 // the last-heard time so the lost-TX check does not hop us away
                 // right after arriving on the commanded channel.
@@ -2346,6 +2365,7 @@ static void SendTimerProcess( void )
                                (unsigned int)HAL_GetTick(), fromCh, toCh);
 
                 ApplyChannelAndSf(toCh, 7);
+                gCompRxHopCount++;
 
                 // Give the new channel a full window before reconsidering.
                 gCompLastOwnRxTick = HAL_GetTick();
@@ -2376,6 +2396,15 @@ static void SendTimerProcess( void )
         }
 #endif
     }
+#if COMPETITION_MODE
+    else
+    {
+        // A transmission is still in flight. Never drop the timer chain on the
+        // floor here: this node reschedules only from inside the branch above,
+        // so returning without re-arming would stall it permanently.
+        CompScheduleNextTx(50);
+    }
+#endif
 }
 
 #if defined(BLD_ENABLE_RFMODE_RSSI_CHECK)
@@ -2670,15 +2699,34 @@ static void CompPrintFinalSummary( void )
     {
         Terminal_Print("   Role: RECEIVER NODE\r\n");
     }
+    Terminal_Print("   Elapsed                : %u s\r\n",
+                   (unsigned int)((HAL_GetTick() - gCompStartTick) / 1000u));
     Terminal_Print("   ----------------------------------------------\r\n");
-    Terminal_Print("   Official TX Success    : %u packets (scored via RX side)\r\n",
-                   (unsigned int)gCompTxSeqNum);
-    Terminal_Print("   Control Packets Sent   : %u (not scored)\r\n",
-                   (unsigned int)gCompCtrlTxCount);
-    Terminal_Print("   Total Received Packets : %u (+%d pts)\r\n",
-                   (unsigned int)gCompRxSuccessCount, (int)gCompRxSuccessCount);
-    Terminal_Print("   Total Rival Packets    : %u (-%d pts)\r\n", 
-                   (unsigned int)gCompRivalRxCount, (int)gCompRivalRxCount * 5);
+
+    if (IS_TX_NODE())
+    {
+        // TX-side numbers. Points are awarded on the RX side, so these are
+        // effort counters, not score.
+        Terminal_Print("   Official TX Success    : %u packets (scored via RX side)\r\n",
+                       (unsigned int)gCompTxSeqNum);
+        Terminal_Print("   Control Packets Sent   : %u (not scored)\r\n",
+                       (unsigned int)gCompCtrlTxCount);
+        Terminal_Print("   Final Cell             : CH%u SF%u\r\n",
+                       gCompChannels[gCurrentChIdx], gCurrentSF);
+    }
+    else
+    {
+        // RX-side numbers: this is where the score actually comes from.
+        Terminal_Print("   Own Packets Received   : %u (+%d pts)\r\n",
+                       (unsigned int)gCompRxSuccessCount, (int)gCompRxSuccessCount);
+        Terminal_Print("   Rival Packets Received : %u (-%d pts)\r\n",
+                       (unsigned int)gCompRivalRxCount, (int)gCompRivalRxCount * 5);
+        Terminal_Print("   Channel Hops           : %u\r\n",
+                       (unsigned int)gCompRxHopCount);
+        Terminal_Print("   Final Cell             : CH%u SF%u\r\n",
+                       gCompChannels[gCurrentChIdx], gCurrentSF);
+    }
+
     Terminal_Print("   Technical Bonuses      : +%d pts (Autonomous Hop + SF Stealth)\r\n",
                    (int)COMP_BONUS_POINTS);
     if (gCompPanicMode)
@@ -2753,6 +2801,48 @@ static void CompPanicChurn( void )
     }
 
     CompScheduleNextTx(PANIC_CHURN_MS);
+}
+
+static void CompPeriodicStatus( void )
+{
+    uint32_t elapsedS;
+
+    if (gCompFinished)
+    {
+        return;
+    }
+    if ((HAL_GetTick() - gCompLastStatusTick) < COMP_STATUS_LOG_MS)
+    {
+        return;
+    }
+    gCompLastStatusTick = HAL_GetTick();
+
+    elapsedS = (HAL_GetTick() - gCompStartTick) / 1000u;
+
+    if (IS_TX_NODE())
+    {
+        Terminal_Print("[%08u] [STATUS] t=%us TX sent=%u ctrl=%u CH=%u SF=%u lbt_blocks=%u\r\n",
+                       (unsigned int)HAL_GetTick(),
+                       (unsigned int)elapsedS,
+                       (unsigned int)gCompTxSeqNum,
+                       (unsigned int)gCompCtrlTxCount,
+                       gCompChannels[gCurrentChIdx],
+                       gCurrentSF,
+                       (unsigned int)gLbtBlockCount);
+    }
+    else
+    {
+        Terminal_Print("[%08u] [STATUS] t=%us RX ok=%u rival=%u score=%d CH=%u SF=%u hops=%u%s\r\n",
+                       (unsigned int)HAL_GetTick(),
+                       (unsigned int)elapsedS,
+                       (unsigned int)gCompRxSuccessCount,
+                       (unsigned int)gCompRivalRxCount,
+                       (int)CompTotalScore(),
+                       gCompChannels[gCurrentChIdx],
+                       gCurrentSF,
+                       (unsigned int)gCompRxHopCount,
+                       gCompPanicMode ? " [PANIC]" : "");
+    }
 }
 
 static void CompCheckDuration( void )
