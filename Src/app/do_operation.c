@@ -76,10 +76,13 @@
 // demodulating (an aborted reception is not a reception, hence no penalty).
 // Latching: there is no way back, by design.
 #define PANIC_SCORE_THRESHOLD   (-50)
-// Dwell time per cell. Any frame whose ToA exceeds this cannot finish
-// demodulating before we move: at SF7/BW125 the 42 B official payload is 113 ms
-// and even a 12 B frame is about 52 ms, so 50 ms cuts off all realistic
-// competition traffic. The node stays in RX the whole time -- it keeps
+// Churn stays on SF10 and only moves between channels. SF10 is orthogonal to
+// the SF7 rivals use for the official payload, so those frames cannot be
+// demodulated at all -- protection that does not depend on timing. Should a
+// rival also be on SF10, its frame (617 ms for 42 B) still far outlasts our
+// dwell below, so it cannot finish either.
+#define PANIC_SF                10
+// Dwell time per channel. The node stays in RX the whole time -- it keeps
 // listening, it just never sits still long enough to complete a frame.
 #define PANIC_CHURN_MS          50
 #define PANIC_LOG_EVERY         50    // Log 1 in N churn steps (UART flood guard)
@@ -2698,10 +2701,11 @@ static void CompEnterPanic( void )
     gCompRxState = COMP_RX_STATE_NORMAL;
 
     Terminal_Print("[%08u] [PANIC] score=%d <= %d : abandoning scoring, "
-                   "high-speed CH/SF churn every %u ms (evasion only)\r\n",
+                   "SF%u channel churn every %u ms (evasion only)\r\n",
                    (unsigned int)HAL_GetTick(),
                    (int)CompEstimatedScore(),
                    (int)PANIC_SCORE_THRESHOLD,
+                   (unsigned)PANIC_SF,
                    (unsigned int)PANIC_CHURN_MS);
 
     CompScheduleNextTx(PANIC_CHURN_MS);
@@ -2710,20 +2714,18 @@ static void CompEnterPanic( void )
 static void CompPanicChurn( void )
 {
     uint16_t ch;
-    uint16_t sf;
 
-    // Walk the 4 cells {CH1,CH7} x {SF7,SF10}. Every step changes the channel,
-    // the spreading factor, or both, so the receiver never sits still long
-    // enough to finish demodulating a frame.
-    gCurrentChIdx = (uint8_t)((gCompPanicIdx >> 1) & 1u);
+    // Hop CH1 <-> CH7 while parked on SF10: rivals on SF7 are orthogonal (their
+    // frames never demodulate here), and the constant channel motion keeps even
+    // an SF10 rival from ever completing one.
+    gCurrentChIdx = (uint8_t)(gCompPanicIdx & 1u);
     ch = gCompChannels[gCurrentChIdx];
-    sf = (gCompPanicIdx & 1u) ? 10 : 7;
 
-    gCompPanicIdx = (uint8_t)((gCompPanicIdx + 1u) & 3u);
+    gCompPanicIdx = (uint8_t)((gCompPanicIdx + 1u) & 1u);
     gCompPanicSteps++;
 
-    gCurrentSF = sf;
-    ApplyChannelAndSf(ch, sf);
+    gCurrentSF = PANIC_SF;
+    ApplyChannelAndSf(ch, PANIC_SF);
 
     // Log sparsely: printing every step would throttle the event loop on UART.
     if ((gCompPanicSteps % PANIC_LOG_EVERY) == 0)
@@ -2731,7 +2733,7 @@ static void CompPanicChurn( void )
         Terminal_Print("[%08u] [PANIC] churn step=%u now CH=%u SF=%u (rival_rx=%u)\r\n",
                        (unsigned int)HAL_GetTick(),
                        (unsigned int)gCompPanicSteps,
-                       ch, sf,
+                       ch, (unsigned)PANIC_SF,
                        (unsigned int)gCompRivalRxCount);
     }
 
