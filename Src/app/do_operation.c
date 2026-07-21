@@ -96,7 +96,8 @@
 #define COMP_DURATION_MS        600000 // 10 minutes (600,000 ms)
 // Periodic status line, so both roles leave a continuous trail in the log even
 // when nothing else happens (the RX node can otherwise be silent for minutes).
-#define COMP_STATUS_LOG_MS      30000  // 30 s
+// On the RX node this line IS the running result: it carries the live score.
+#define COMP_STATUS_LOG_MS      20000  // 20 s (30 progress reports over the match)
 
 // --- State Machine for TX ---
 typedef enum {
